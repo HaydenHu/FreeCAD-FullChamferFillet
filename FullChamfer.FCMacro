@@ -1,0 +1,284 @@
+# -*- coding: utf-8 -*-
+# Macro: FullChamfer
+# 图标: 完全倒角
+# 功能: 对选中的边执行完全倒角（倒角面完全覆盖相邻侧面）
+# 原理: 构造切割块 + 布尔差集实现完全倒角
+#
+# 使用方法:
+#   1. 在 PartDesign 工作台中选中一条或多条边
+#   2. 运行此宏
+#   3. 输入倒角距离（默认=相邻面最小边长=完全倒角）
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+from PySide import QtGui, QtCore
+
+
+def vertices_equal(v1, v2, tol=1e-7):
+    return v1.Point.distanceToPoint(v2.Point) < tol
+
+
+def get_edge_normals(edge, shape):
+    """获取边的两个相邻面的法向量(调整为朝外)."""
+    v0 = edge.Vertexes[0].Point
+    v1 = edge.Vertexes[1].Point
+    faces = []
+    normals = []
+    for f in shape.Faces:
+        f_verts = [vp.Point for vp in f.Vertexes]
+        hits = 0
+        for sv in [v0, v1]:
+            for fv in f_verts:
+                if sv.distanceToPoint(fv) < 1e-6:
+                    hits += 1
+                    break
+        if hits >= 2:
+            faces.append(f)
+            n = f.normalAt(0.5, 0.5)
+            normals.append(n)
+    for i, (n, f) in enumerate(zip(normals, faces)):
+        center = f.CenterOfMass
+        if n.dot(center - v0) < 0:
+            normals[i] = -n
+    return normals, faces
+
+
+def get_min_adjacent_edge_length(selected_edge, shape):
+    min_len = float('inf')
+    v0 = selected_edge.Vertexes[0].Point
+    v1 = selected_edge.Vertexes[1].Point
+    for face in shape.Faces:
+        f_verts = [vp.Point for vp in face.Vertexes]
+        hits = 0
+        for sv in [v0, v1]:
+            for fv in f_verts:
+                if sv.distanceToPoint(fv) < 1e-6:
+                    hits += 1
+                    break
+        if hits < 2:
+            continue
+        for other_edge in face.Edges:
+            ov0 = other_edge.Vertexes[0].Point
+            ov1 = other_edge.Vertexes[1].Point
+            if ((ov0.distanceToPoint(v0) < 1e-6 and ov1.distanceToPoint(v1) < 1e-6)
+                    or (ov0.distanceToPoint(v1) < 1e-6 and ov1.distanceToPoint(v0) < 1e-6)):
+                continue
+            L = other_edge.Length
+            if L > 1e-7 and L < min_len:
+                min_len = L
+    return min_len if min_len != float('inf') else 0.0
+
+
+def find_body(obj):
+    if obj.TypeId == 'PartDesign::Body':
+        return obj
+    for p in obj.InList:
+        if p.TypeId == 'PartDesign::Body':
+            return p
+    try:
+        g = obj.getParentGroup()
+        if g and g.TypeId == 'PartDesign::Body':
+            return g
+    except Exception:
+        pass
+    return None
+
+
+def create_chamfer_cutter(shape, edge_idx, chamfer_dist):
+    """构造倒角切割楔体（三角形截面沿边拉伸）."""
+    edge = shape.Edges[edge_idx]
+    v0 = edge.Vertexes[0].Point
+    v1 = edge.Vertexes[1].Point
+    ev = (v1 - v0).normalize()
+    d = chamfer_dist
+
+    normals, _ = get_edge_normals(edge, shape)
+    if len(normals) < 2:
+        raise RuntimeError("边至少需要两个相邻面")
+    n0, n1 = normals[0], normals[1]
+
+    # 向实体内部方向切割
+    cut0 = -n0
+    cut1 = -n1
+    ext = 5.0
+
+    pts_start = [
+        v0 - ev * ext,
+        v0 + cut0 * (d + 2) - ev * ext,
+        v0 + cut1 * (d + 2) - ev * ext,
+    ]
+    pts_end = [
+        v1 + ev * ext,
+        v1 + cut0 * (d + 2) + ev * ext,
+        v1 + cut1 * (d + 2) + ev * ext,
+    ]
+    pts_all = pts_start + pts_end
+
+    def mkface(ix):
+        poly = Part.makePolygon([pts_all[i] for i in ix] + [pts_all[ix[0]]])
+        return Part.Face(Part.Wire(poly))
+
+    fs = [
+        mkface([0, 1, 2]),        # 起始三角形
+        mkface([3, 4, 5]),        # 结束三角形
+        mkface([0, 1, 4, 3]),     # n0侧面
+        mkface([0, 2, 5, 3]),     # n1侧面
+        mkface([1, 2, 5, 4]),     # 斜面 (倒角面)
+    ]
+
+    shell = Part.makeShell(fs)
+    if shell.isNull():
+        raise RuntimeError("无法创建切割壳体")
+    solid = Part.makeSolid(shell)
+    if solid is None or solid.isNull():
+        raise RuntimeError("无法创建切割实体")
+    return solid
+
+
+def main():
+    doc = App.ActiveDocument
+    if not doc:
+        QtGui.QMessageBox.warning(None, "错误", "请先打开文档。")
+        return
+
+    sel = Gui.Selection.getSelectionEx()
+    if not sel:
+        QtGui.QMessageBox.warning(None, "错误", "请先选中一条或多条边。")
+        return
+
+    edge_list = []
+    for s in sel:
+        if not hasattr(s.Object, 'Shape'):
+            continue
+        obj = s.Object
+        shape = obj.Shape
+        body = find_body(obj)
+        for sn in s.SubElementNames:
+            if sn.startswith('Edge'):
+                try:
+                    edge_list.append({
+                        'edge': shape.getElement(sn),
+                        'shape': shape,
+                        'body': body,
+                        'obj': obj,
+                        'sub': sn,
+                    })
+                except Exception:
+                    pass
+
+    if not edge_list:
+        QtGui.QMessageBox.warning(None, "错误", "未获取到有效边。")
+        return
+
+    # 计算每条边的最小邻边长
+    edge_data = []
+    for eo in edge_list:
+        min_l = get_min_adjacent_edge_length(eo['edge'], eo['shape'])
+        if min_l < 1e-7:
+            QtGui.QMessageBox.warning(None, "错误",
+                f"边 {eo['sub']} 无相邻面可计算。")
+            return
+        edge_data.append({'eo': eo, 'min_len': min_l})
+
+    # 对话框
+    dlg = QtGui.QDialog()
+    dlg.setWindowTitle("完全倒角")
+    dlg.setMinimumWidth(380)
+    dlg.setModal(True)
+    layout = QtGui.QVBoxLayout()
+
+    layout.addWidget(QtGui.QLabel(
+        f"<b>完全倒角</b><br>已选中 {len(edge_list)} 条边"))
+    layout.addSpacing(8)
+
+    dist_layout = QtGui.QHBoxLayout()
+    dist_layout.addWidget(QtGui.QLabel("倒角距离 (mm):"))
+    dist_spin = QtGui.QDoubleSpinBox()
+    dist_spin.setRange(0.001, 99999.0)
+    dist_spin.setDecimals(4)
+    dist_spin.setSingleStep(0.1)
+    dist_spin.setValue(edge_data[0]['min_len'])
+    dist_layout.addWidget(dist_spin)
+    layout.addLayout(dist_layout)
+
+    layout.addSpacing(4)
+
+    info_text = "各边最小邻边长 (完全倒角距离):\n"
+    for i, ed in enumerate(edge_data):
+        info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm\n"
+    layout.addWidget(QtGui.QLabel(info_text))
+
+    layout.addSpacing(8)
+
+    btn_layout = QtGui.QHBoxLayout()
+    ok = QtGui.QPushButton("执行倒角")
+    ok.clicked.connect(dlg.accept)
+    cancel = QtGui.QPushButton("取消")
+    cancel.clicked.connect(dlg.reject)
+    btn_layout.addWidget(ok)
+    btn_layout.addWidget(cancel)
+    layout.addLayout(btn_layout)
+    dlg.setLayout(layout)
+
+    if dlg.exec_() != QtGui.QDialog.Accepted:
+        return
+
+    chamfer_dist = dist_spin.value()
+    if chamfer_dist <= 0:
+        return
+
+    doc.openTransaction("Full Chamfer")
+    errors = []
+
+    for eo in edge_list:
+        try:
+            base_shape = eo['shape']
+            edge_idx = int(eo['sub'].replace('Edge', '')) - 1
+            d = chamfer_dist
+
+            new_shape = None
+            # 小距离先试 API
+            if d < edge_data[0]['min_len'] * 0.99:
+                try:
+                    new_shape = base_shape.makeChamfer(d, d, [base_shape.Edges[edge_idx]])
+                except Exception:
+                    pass
+
+            if new_shape is None or new_shape.isNull():
+                cutter = create_chamfer_cutter(base_shape, edge_idx, d)
+                new_shape = base_shape.cut(cutter)
+
+            if new_shape is None or new_shape.isNull():
+                raise RuntimeError("倒角生成失败")
+
+            body = eo['body']
+            if body:
+                result_obj = doc.addObject('Part::Feature', 'FullChamfer')
+                result_obj.Shape = new_shape.removeSplitter()
+                result_obj.Label = f"FullChamfer_{eo['sub']}"
+                if hasattr(eo['obj'], 'ViewObject') and hasattr(result_obj, 'ViewObject'):
+                    result_obj.ViewObject.ShapeColor = eo['obj'].ViewObject.ShapeColor
+                eo['obj'].Visibility = False
+                body.Visibility = False
+                doc.recompute()
+            else:
+                eo['obj'].Shape = new_shape
+                doc.recompute()
+
+        except Exception as e:
+            errors.append(f"边 {eo['sub']}: {e}")
+
+    if errors:
+        doc.abortTransaction()
+        QtGui.QMessageBox.critical(None, "倒角失败",
+            f"{len(errors)}/{len(edge_list)} 条边失败:\n" + "\n".join(errors))
+    else:
+        doc.commitTransaction()
+        QtGui.QMessageBox.information(None, "完成",
+            f"已为 {len(edge_list)} 条边创建倒角。\n距离: {chamfer_dist:.4f} mm")
+
+
+if __name__ == '__main__':
+    main()
