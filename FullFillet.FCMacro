@@ -347,9 +347,8 @@ def main():
                 doc.recompute()
 
         doc.commitTransaction()
-        tip_text = "PartDesign 特征" if done_by_feature else "布尔切割"
-        QtGui.QMessageBox.information(None, "完成",
-            f"已为 {len(edge_list)} 条边创建完全圆角 ({tip_text})。\n半径: {r:.4f} mm")
+        App.Console.PrintMessage(
+            f"FullFillet: {len(edge_list)} 条边, 半径: {r:.4f} mm\n")
 
     except Exception as e:
         doc.abortTransaction()
