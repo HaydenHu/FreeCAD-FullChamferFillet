@@ -43,6 +43,7 @@ git clone https://github.com/HaydenHu/FreeCAD-FullChamferFillet.git .
 6. 点击 **Close**
 
 ## 使用方法
+<img width="1280" height="688" alt="QQ20260517-191504" src="https://github.com/user-attachments/assets/f584fab2-bacf-4060-8759-7a09a73cf6df" />
 
 1. 在 PartDesign 工作台中选中 Body 的一个 feature
 2. 切换到边选择模式（点击工具栏的边选择图标）
