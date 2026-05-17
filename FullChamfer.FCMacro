@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # Macro: FullChamfer
 # 图标: 完全倒角
-# 功能: 对选中的边执行完全倒角（倒角面完全覆盖相邻侧面）
-# 原理: 构造切割块 + 布尔差集实现完全倒角
+# 功能: 对选中的边执行倒角。
+#       半径 < 最小邻边长 → 使用 FreeCAD 自带 PartDesign Chamfer
+#       半径 >= 最小邻边长 → 构造切割体 + 布尔差集（完全倒角）
 #
 # 使用方法:
 #   1. 在 PartDesign 工作台中选中一条或多条边
@@ -14,35 +15,11 @@ import FreeCADGui as Gui
 import Part
 from FreeCAD import Vector
 from PySide import QtGui, QtCore
+import math
 
 
 def vertices_equal(v1, v2, tol=1e-7):
     return v1.Point.distanceToPoint(v2.Point) < tol
-
-
-def get_edge_normals(edge, shape):
-    """获取边的两个相邻面的法向量(调整为朝外)."""
-    v0 = edge.Vertexes[0].Point
-    v1 = edge.Vertexes[1].Point
-    faces = []
-    normals = []
-    for f in shape.Faces:
-        f_verts = [vp.Point for vp in f.Vertexes]
-        hits = 0
-        for sv in [v0, v1]:
-            for fv in f_verts:
-                if sv.distanceToPoint(fv) < 1e-6:
-                    hits += 1
-                    break
-        if hits >= 2:
-            faces.append(f)
-            n = f.normalAt(0.5, 0.5)
-            normals.append(n)
-    for i, (n, f) in enumerate(zip(normals, faces)):
-        center = f.CenterOfMass
-        if n.dot(center - v0) < 0:
-            normals[i] = -n
-    return normals, faces
 
 
 def get_min_adjacent_edge_length(selected_edge, shape):
@@ -86,6 +63,15 @@ def find_body(obj):
     return None
 
 
+def get_tip(body):
+    if hasattr(body, 'Tip') and body.Tip:
+        return body.Tip
+    for o in reversed(body.Group):
+        if hasattr(o, 'Shape') and not o.Shape.isNull():
+            return o
+    return None
+
+
 def create_chamfer_cutter(shape, edge_idx, chamfer_dist):
     """构造倒角切割楔体（三角形截面沿边拉伸）."""
     edge = shape.Edges[edge_idx]
@@ -94,12 +80,32 @@ def create_chamfer_cutter(shape, edge_idx, chamfer_dist):
     ev = (v1 - v0).normalize()
     d = chamfer_dist
 
-    normals, _ = get_edge_normals(edge, shape)
+    # 法向量
+    faces = []
+    normals = []
+    for f in shape.Faces:
+        f_verts = [vp.Point for vp in f.Vertexes]
+        hits = 0
+        for sv in [v0, v1]:
+            for fv in f_verts:
+                if sv.distanceToPoint(fv) < 1e-6:
+                    hits += 1
+                    break
+        if hits >= 2:
+            faces.append(f)
+            n = f.normalAt(0.5, 0.5)
+            normals.append(n)
+
     if len(normals) < 2:
         raise RuntimeError("边至少需要两个相邻面")
+
+    n0, n1 = normals[0], normals[1]
+    for i, (n, f) in enumerate([(n0, faces[0]), (n1, faces[1])]):
+        center = f.CenterOfMass
+        if n.dot(center - v0) < 0:
+            normals[i] = -n
     n0, n1 = normals[0], normals[1]
 
-    # 向实体内部方向切割
     cut0 = -n0
     cut1 = -n1
     ext = 5.0
@@ -121,11 +127,11 @@ def create_chamfer_cutter(shape, edge_idx, chamfer_dist):
         return Part.Face(Part.Wire(poly))
 
     fs = [
-        mkface([0, 1, 2]),        # 起始三角形
-        mkface([3, 4, 5]),        # 结束三角形
-        mkface([0, 1, 4, 3]),     # n0侧面
-        mkface([0, 2, 5, 3]),     # n1侧面
-        mkface([1, 2, 5, 4]),     # 斜面 (倒角面)
+        mkface([0, 1, 2]),
+        mkface([3, 4, 5]),
+        mkface([0, 1, 4, 3]),
+        mkface([0, 2, 5, 3]),
+        mkface([1, 2, 5, 4]),
     ]
 
     shell = Part.makeShell(fs)
@@ -172,7 +178,6 @@ def main():
         QtGui.QMessageBox.warning(None, "错误", "未获取到有效边。")
         return
 
-    # 计算每条边的最小邻边长
     edge_data = []
     for eo in edge_list:
         min_l = get_min_adjacent_edge_length(eo['edge'], eo['shape'])
@@ -210,6 +215,26 @@ def main():
         info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm\n"
     layout.addWidget(QtGui.QLabel(info_text))
 
+    layout.addSpacing(4)
+
+    # 方法提示
+    method_label = QtGui.QLabel("")
+    layout.addWidget(method_label)
+
+    def update_hint():
+        d = dist_spin.value()
+        ml = edge_data[0]['min_len']
+        if d <= ml * 1.001:
+            method_label.setText(
+                f"<span style='color:#228833;'>使用 PartDesign Chamfer（标准特征）</span>")
+        else:
+            method_label.setText(
+                f"<span style='color:#cc8800;'>使用布尔切割（完全倒角）</span>")
+        method_label.setTextFormat(QtCore.Qt.RichText)
+
+    dist_spin.valueChanged.connect(lambda v: update_hint())
+    update_hint()
+
     layout.addSpacing(8)
 
     btn_layout = QtGui.QHBoxLayout()
@@ -229,55 +254,79 @@ def main():
     if chamfer_dist <= 0:
         return
 
+    d = chamfer_dist
+    all_native = all(
+        d < get_min_adjacent_edge_length(eo2['edge'], eo2['shape'])
+        and eo2['body'] is not None
+        for eo2 in edge_list
+    )
+
     doc.openTransaction("Full Chamfer")
-    errors = []
+    try:
+        base_shape = edge_list[0]['shape']
+        done_by_feature = False
 
-    for eo in edge_list:
-        try:
-            base_shape = eo['shape']
-            edge_idx = int(eo['sub'].replace('Edge', '')) - 1
-            d = chamfer_dist
-
+        if all_native:
+            # 小半径 → PartDesign Chamfer feature
+            body = edge_list[0]['body']
+            tip = get_tip(body)
+            if tip is None:
+                raise RuntimeError("无法获取 Body 的 Tip feature")
+            edge_names = [eo2['sub'] for eo2 in edge_list]
+            chamfer = doc.addObject('PartDesign::Chamfer', 'Chamfer')
+            body.addObject(chamfer)
+            chamfer.Base = (tip, edge_names)
+            chamfer.Size = d
+            body.recompute()
+            done_by_feature = True
+        else:
+            # 大半径 → 先试 shape.makeChamfer, 失败则布尔切割
             new_shape = None
-            # 小距离先试 API
-            if d < edge_data[0]['min_len'] * 0.99:
-                try:
-                    new_shape = base_shape.makeChamfer(d, d, [base_shape.Edges[edge_idx]])
-                except Exception:
-                    pass
+            try:
+                edges = [base_shape.Edges[int(eo2['sub'].replace('Edge',''))-1]
+                         for eo2 in edge_list]
+                new_shape = base_shape.makeChamfer(d, d, edges)
+            except Exception:
+                pass
 
             if new_shape is None or new_shape.isNull():
-                cutter = create_chamfer_cutter(base_shape, edge_idx, d)
-                new_shape = base_shape.cut(cutter)
+                cutters = []
+                for eo2 in edge_list:
+                    e_idx = int(eo2['sub'].replace('Edge', '')) - 1
+                    cutter = create_chamfer_cutter(base_shape, e_idx, d)
+                    if cutter is None or cutter.isNull():
+                        raise RuntimeError(f"边 {eo2['sub']} 切割体构造失败")
+                    cutters.append(cutter)
+
+                combined_cutter = cutters[0]
+                for c in cutters[1:]:
+                    combined_cutter = combined_cutter.fuse(c)
+                new_shape = base_shape.cut(combined_cutter)
 
             if new_shape is None or new_shape.isNull():
                 raise RuntimeError("倒角生成失败")
 
-            body = eo['body']
+            body = edge_list[0]['body']
+            obj = edge_list[0]['obj']
             if body:
-                result_obj = doc.addObject('Part::Feature', 'FullChamfer')
+                result_obj = doc.addObject('PartDesign::Feature', 'FullChamfer')
                 result_obj.Shape = new_shape.removeSplitter()
-                result_obj.Label = f"FullChamfer_{eo['sub']}"
-                if hasattr(eo['obj'], 'ViewObject') and hasattr(result_obj, 'ViewObject'):
-                    result_obj.ViewObject.ShapeColor = eo['obj'].ViewObject.ShapeColor
-                eo['obj'].Visibility = False
-                body.Visibility = False
-                doc.recompute()
+                result_obj.Label = "FullChamfer"
+                body.addObject(result_obj)
+                obj.Visibility = False
+                body.recompute()
             else:
-                eo['obj'].Shape = new_shape
+                obj.Shape = new_shape
                 doc.recompute()
 
-        except Exception as e:
-            errors.append(f"边 {eo['sub']}: {e}")
-
-    if errors:
-        doc.abortTransaction()
-        QtGui.QMessageBox.critical(None, "倒角失败",
-            f"{len(errors)}/{len(edge_list)} 条边失败:\n" + "\n".join(errors))
-    else:
         doc.commitTransaction()
+        tip_text = "PartDesign 特征" if done_by_feature else "布尔切割"
         QtGui.QMessageBox.information(None, "完成",
-            f"已为 {len(edge_list)} 条边创建倒角。\n距离: {chamfer_dist:.4f} mm")
+            f"已为 {len(edge_list)} 条边创建倒角。\n距离: {d:.4f} mm")
+
+    except Exception as e:
+        doc.abortTransaction()
+        QtGui.QMessageBox.critical(None, "倒角失败", str(e))
 
 
 if __name__ == '__main__':

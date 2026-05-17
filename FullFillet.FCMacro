@@ -64,6 +64,15 @@ def find_body(obj):
     return None
 
 
+def get_tip(body):
+    if hasattr(body, 'Tip') and body.Tip:
+        return body.Tip
+    for o in reversed(body.Group):
+        if hasattr(o, 'Shape') and not o.Shape.isNull():
+            return o
+    return None
+
+
 def create_fillet_cutter(shape, edge_idx, fillet_radius):
     """构造圆角切割体——截面+extrude 双向拉伸."""
     edge = shape.Edges[edge_idx]
@@ -196,15 +205,15 @@ def main():
     radius_spin.setRange(0.001, 99999.0)
     radius_spin.setDecimals(4)
     radius_spin.setSingleStep(0.1)
-    radius_spin.setValue(edge_data[0]['min_len'] / 2.0)
+    radius_spin.setValue(edge_data[0]['min_len'])
     dist_layout.addWidget(radius_spin)
     layout.addLayout(dist_layout)
 
     layout.addSpacing(4)
 
-    info_text = "各边最小邻边长  →  完全圆角半径:\n"
+    info_text = "各边最小邻边长:\n"
     for i, ed in enumerate(edge_data):
-        info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm  →  {ed['min_len'] / 2:.4f} mm\n"
+        info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm\n"
     layout.addWidget(QtGui.QLabel(info_text))
 
     layout.addSpacing(4)
@@ -221,12 +230,12 @@ def main():
 
     def on_slider(v):
         scale_label.setText(f"{v / 100.0:.2f}")
-        r = edge_data[0]['min_len'] / 2.0 * v / 100.0
+        r = edge_data[0]['min_len'] * v / 100.0
         radius_spin.setValue(r)
 
     def on_spin(v):
         if edge_data[0]['min_len'] > 0:
-            s = int(v / (edge_data[0]['min_len'] / 2.0) * 100)
+            s = int(v / edge_data[0]['min_len'] * 100)
             scale_slider.blockSignals(True)
             scale_slider.setValue(max(1, min(200, s)))
             scale_slider.blockSignals(False)
@@ -254,55 +263,79 @@ def main():
     if radius <= 0:
         return
 
+    r = radius
+    all_native = all(
+        r < get_min_adjacent_edge_length(eo2['edge'], eo2['shape'])
+        and eo2['body'] is not None
+        for eo2 in edge_list
+    )
+
     doc.openTransaction("Full Fillet")
-    errors = []
+    try:
+        base_shape = edge_list[0]['shape']
+        done_by_feature = False
 
-    for eo in edge_list:
-        try:
-            base_shape = eo['shape']
-            edge_idx = int(eo['sub'].replace('Edge', '')) - 1
-            r = radius
-
+        if all_native:
+            # 小半径 → PartDesign Fillet feature
+            body = edge_list[0]['body']
+            tip = get_tip(body)
+            if tip is None:
+                raise RuntimeError("无法获取 Body 的 Tip feature")
+            edge_names = [eo2['sub'] for eo2 in edge_list]
+            fillet = doc.addObject('PartDesign::Fillet', 'Fillet')
+            body.addObject(fillet)
+            fillet.Base = (tip, edge_names)
+            fillet.Radius = r
+            body.recompute()
+            done_by_feature = True
+        else:
+            # 大半径 → 先试 shape.makeFillet, 失败则布尔切割
             new_shape = None
-            min_l = get_min_adjacent_edge_length(eo['edge'], base_shape)
-            if r < min_l / 2.0 * 0.99:
-                try:
-                    new_shape = base_shape.makeFillet(r, [base_shape.Edges[edge_idx]])
-                except Exception:
-                    pass
+            try:
+                edges = [base_shape.Edges[int(eo2['sub'].replace('Edge',''))-1]
+                         for eo2 in edge_list]
+                new_shape = base_shape.makeFillet(r, edges)
+            except Exception:
+                pass
 
             if new_shape is None or new_shape.isNull():
-                cutter = create_fillet_cutter(base_shape, edge_idx, r)
-                new_shape = base_shape.cut(cutter)
+                cutters = []
+                for eo2 in edge_list:
+                    e_idx = int(eo2['sub'].replace('Edge', '')) - 1
+                    cutter = create_fillet_cutter(base_shape, e_idx, r)
+                    if cutter is None or cutter.isNull():
+                        raise RuntimeError(f"边 {eo2['sub']} 切割体构造失败")
+                    cutters.append(cutter)
+
+                combined_cutter = cutters[0]
+                for c in cutters[1:]:
+                    combined_cutter = combined_cutter.fuse(c)
+                new_shape = base_shape.cut(combined_cutter)
 
             if new_shape is None or new_shape.isNull():
                 raise RuntimeError("圆角生成失败")
 
-            body = eo['body']
+            body = edge_list[0]['body']
+            obj = edge_list[0]['obj']
             if body:
-                result_obj = doc.addObject('Part::Feature', 'FullFillet')
+                result_obj = doc.addObject('PartDesign::Feature', 'FullFillet')
                 result_obj.Shape = new_shape.removeSplitter()
-                result_obj.Label = f"FullFillet_{eo['sub']}"
-                if hasattr(eo['obj'], 'ViewObject') and hasattr(result_obj, 'ViewObject'):
-                    result_obj.ViewObject.ShapeColor = eo['obj'].ViewObject.ShapeColor
-                eo['obj'].Visibility = False
-                body.Visibility = False
-                doc.recompute()
+                result_obj.Label = "FullFillet"
+                body.addObject(result_obj)
+                obj.Visibility = False
+                body.recompute()
             else:
-                eo['obj'].Shape = new_shape
+                obj.Shape = new_shape
                 doc.recompute()
 
-        except Exception as e:
-            errors.append(f"边 {eo['sub']}: {e}")
-
-    if errors:
-        doc.abortTransaction()
-        QtGui.QMessageBox.critical(None, "圆角失败",
-            f"{len(errors)}/{len(edge_list)} 条边失败:\n" + "\n".join(errors))
-    else:
         doc.commitTransaction()
+        tip_text = "PartDesign 特征" if done_by_feature else "布尔切割"
         QtGui.QMessageBox.information(None, "完成",
-            f"已为 {len(edge_list)} 条边创建完全圆角。\n半径: {radius:.4f} mm")
+            f"已为 {len(edge_list)} 条边创建完全圆角 ({tip_text})。\n半径: {r:.4f} mm")
+
+    except Exception as e:
+        doc.abortTransaction()
+        QtGui.QMessageBox.critical(None, "圆角失败", str(e))
 
 
 if __name__ == '__main__':
