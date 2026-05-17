@@ -182,14 +182,27 @@ def main():
         QtGui.QMessageBox.warning(None, "错误", "未获取到有效边。")
         return
 
+    def get_default_fillet_radius(edge, shape):
+        """获取默认圆角半径：圆边用圆半径，直边用最小邻边长."""
+        try:
+            c = edge.Curve
+            if hasattr(c, 'Radius') and c.Radius > 0:
+                return c.Radius, True
+        except Exception:
+            pass
+        min_l = get_min_adjacent_edge_length(edge, shape)
+        return min_l, False
+
     edge_data = []
     for eo in edge_list:
+        default_r, is_circle = get_default_fillet_radius(eo['edge'], eo['shape'])
         min_l = get_min_adjacent_edge_length(eo['edge'], eo['shape'])
-        if min_l < 1e-7:
+        if default_r < 1e-7:
             QtGui.QMessageBox.warning(None, "错误",
-                f"边 {eo['sub']} 无相邻面可计算。")
+                f"边 {eo['sub']} 无法计算参数。")
             return
-        edge_data.append({'eo': eo, 'min_len': min_l})
+        edge_data.append({'eo': eo, 'default_r': default_r,
+                          'min_len': min_l, 'is_circle': is_circle})
 
     # 对话框
     dlg = QtGui.QDialog()
@@ -208,15 +221,17 @@ def main():
     radius_spin.setRange(0.001, 99999.0)
     radius_spin.setDecimals(4)
     radius_spin.setSingleStep(0.1)
-    radius_spin.setValue(edge_data[0]['min_len'])
+    radius_spin.setValue(edge_data[0]['default_r'])
     dist_layout.addWidget(radius_spin)
     layout.addLayout(dist_layout)
 
     layout.addSpacing(4)
 
-    info_text = "各边最小邻边长:\n"
+    info_text = "各边参数:\n"
     for i, ed in enumerate(edge_data):
-        info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm\n"
+        typ = "圆边" if ed['is_circle'] else "直边"
+        info_text += (f"  边 {i + 1} ({typ}): 默认 {ed['default_r']:.4f} mm"
+                      f"  最小邻边长 {ed['min_len']:.4f} mm\n")
     layout.addWidget(QtGui.QLabel(info_text))
 
     layout.addSpacing(4)
@@ -233,12 +248,12 @@ def main():
 
     def on_slider(v):
         scale_label.setText(f"{v / 100.0:.2f}")
-        r = edge_data[0]['min_len'] * v / 100.0
+        r = edge_data[0]['default_r'] * v / 100.0
         radius_spin.setValue(r)
 
     def on_spin(v):
-        if edge_data[0]['min_len'] > 0:
-            s = int(v / edge_data[0]['min_len'] * 100)
+        if edge_data[0]['default_r'] > 0:
+            s = int(v / edge_data[0]['default_r'] * 100)
             scale_slider.blockSignals(True)
             scale_slider.setValue(max(1, min(200, s)))
             scale_slider.blockSignals(False)

@@ -184,14 +184,28 @@ def main():
         QtGui.QMessageBox.warning(None, "错误", "未获取到有效边。")
         return
 
+    def get_default_chamfer_dist(edge, shape):
+        """获取默认倒角距离：圆边用圆半径，直边用最小邻边长."""
+        # 检查是否是圆形边
+        try:
+            c = edge.Curve
+            if hasattr(c, 'Radius') and c.Radius > 0:
+                return c.Radius, True  # 圆形边
+        except Exception:
+            pass
+        min_l = get_min_adjacent_edge_length(edge, shape)
+        return min_l, False  # 直边
+
     edge_data = []
     for eo in edge_list:
+        default_d, is_circle = get_default_chamfer_dist(eo['edge'], eo['shape'])
         min_l = get_min_adjacent_edge_length(eo['edge'], eo['shape'])
-        if min_l < 1e-7:
+        if default_d < 1e-7:
             QtGui.QMessageBox.warning(None, "错误",
-                f"边 {eo['sub']} 无相邻面可计算。")
+                f"边 {eo['sub']} 无法计算参数。")
             return
-        edge_data.append({'eo': eo, 'min_len': min_l})
+        edge_data.append({'eo': eo, 'default_d': default_d,
+                          'min_len': min_l, 'is_circle': is_circle})
 
     # 对话框
     dlg = QtGui.QDialog()
@@ -210,15 +224,17 @@ def main():
     dist_spin.setRange(0.001, 99999.0)
     dist_spin.setDecimals(4)
     dist_spin.setSingleStep(0.1)
-    dist_spin.setValue(edge_data[0]['min_len'])
+    dist_spin.setValue(edge_data[0]['default_d'])
     dist_layout.addWidget(dist_spin)
     layout.addLayout(dist_layout)
 
     layout.addSpacing(4)
 
-    info_text = "各边最小邻边长 (完全倒角距离):\n"
+    info_text = "各边参数:\n"
     for i, ed in enumerate(edge_data):
-        info_text += f"  边 {i + 1}: {ed['min_len']:.4f} mm\n"
+        typ = "圆边" if ed['is_circle'] else "直边"
+        info_text += (f"  边 {i + 1} ({typ}): 默认 {ed['default_d']:.4f} mm"
+                      f"  最小邻边长 {ed['min_len']:.4f} mm\n")
     layout.addWidget(QtGui.QLabel(info_text))
 
     layout.addSpacing(4)
@@ -230,7 +246,7 @@ def main():
     def update_hint():
         d = dist_spin.value()
         ml = edge_data[0]['min_len']
-        if d <= ml * 1.001:
+        if d < ml:
             method_label.setText(
                 f"<span style='color:#228833;'>使用 PartDesign Chamfer（标准特征）</span>")
         else:
