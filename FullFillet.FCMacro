@@ -17,31 +17,34 @@ from PySide import QtGui, QtCore
 import math
 
 
-def vertices_equal(v1, v2, tol=1e-7):
-    return v1.Point.distanceToPoint(v2.Point) < tol
+def get_adjacent_faces(edge, shape):
+    """获取包含此边的所有面."""
+    mid_p = (edge.FirstParameter + edge.LastParameter) / 2.0
+    mid_pt = edge.valueAt(mid_p)
+    faces = []
+    for f in shape.Faces:
+        try:
+            d, _, _ = f.distToShape(Part.Vertex(mid_pt))
+            if d < 1e-5:
+                faces.append(f)
+        except Exception:
+            pass
+    return faces
 
 
-def edge_contains_vertex(edge, vertex, tol=1e-7):
-    for v in edge.Vertexes:
-        if vertices_equal(v, vertex, tol):
-            return True
-    return False
+def edges_same(e1, e2, tol=1e-5):
+    mid1 = (e1.FirstParameter + e1.LastParameter) / 2.0
+    mid2 = (e2.FirstParameter + e2.LastParameter) / 2.0
+    if e1.valueAt(mid1).distanceToPoint(e2.valueAt(mid2)) > tol:
+        return False
+    return abs(e1.Length - e2.Length) < tol
 
 
 def get_min_adjacent_edge_length(selected_edge, shape):
     min_len = float('inf')
-    selected_verts = selected_edge.Vertexes
-    for face in shape.Faces:
-        ok = True
-        for sv in selected_verts:
-            if not edge_contains_vertex(face, sv):
-                ok = False
-                break
-        if not ok:
-            continue
+    for face in get_adjacent_faces(selected_edge, shape):
         for other_edge in face.Edges:
-            if (edge_contains_vertex(other_edge, selected_verts[0])
-                    and edge_contains_vertex(other_edge, selected_verts[1])):
+            if edges_same(other_edge, selected_edge):
                 continue
             L = other_edge.Length
             if L > 1e-7 and L < min_len:
@@ -76,33 +79,34 @@ def get_tip(body):
 def create_fillet_cutter(shape, edge_idx, fillet_radius):
     """构造圆角切割体——截面+extrude 双向拉伸."""
     edge = shape.Edges[edge_idx]
-    v0 = edge.Vertexes[0].Point
-    v1 = edge.Vertexes[1].Point
-    ev = (v1 - v0).normalize()
-    el = (v1 - v0).Length
     r = fillet_radius
 
-    # 获取两个面的法向量
-    faces = []
+    # 参数方式获取起终点（兼容圆形边）
+    fp = edge.FirstParameter
+    lp = edge.LastParameter
+    v0 = edge.valueAt(fp)
+    v1 = edge.valueAt(lp)
+    if v0.distanceToPoint(v1) < 1e-5:
+        v1 = edge.valueAt(fp + (lp - fp) / 2.0)
+    el = (v1 - v0).Length
+
+    # 中点切线
+    mid_p = (fp + lp) / 2.0
+    ev = edge.tangentAt(mid_p)
+    ev.normalize()
+
+    # 相邻面
+    adj_faces = get_adjacent_faces(edge, shape)
     normals = []
-    for f in shape.Faces:
-        f_verts = [vp.Point for vp in f.Vertexes]
-        hits = 0
-        for sv in [v0, v1]:
-            for fv in f_verts:
-                if sv.distanceToPoint(fv) < 1e-6:
-                    hits += 1
-                    break
-        if hits >= 2:
-            faces.append(f)
-            n = f.normalAt(0.5, 0.5)
-            normals.append(n)
+    for f in adj_faces:
+        n = f.normalAt(0.5, 0.5)
+        normals.append(n)
 
     if len(normals) < 2:
         raise RuntimeError("边至少需要两个相邻面")
 
     n0, n1 = normals[0], normals[1]
-    for i, (n, f) in enumerate([(n0, faces[0]), (n1, faces[1])]):
+    for i, (n, f) in enumerate([(n0, adj_faces[0]), (n1, adj_faces[1])]):
         center = f.CenterOfMass
         if n.dot(center - v0) < 0:
             normals[i] = -n
@@ -121,7 +125,6 @@ def create_fillet_cutter(shape, edge_idx, fillet_radius):
         return v0 + x_dir * a + y_dir * b
 
     # 截面: origin→直边→弧→直边→origin
-    # 弧从 pt(r,0) 到 pt(0,r), 圆心 pt(r,r)
     mid_angle = 5 * math.pi / 4
     mid_pt = pt(r + r * math.cos(mid_angle), r + r * math.sin(mid_angle))
     arc = Part.Arc(pt(r, 0), mid_pt, pt(0, r))

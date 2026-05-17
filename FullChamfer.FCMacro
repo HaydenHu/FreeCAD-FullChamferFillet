@@ -15,32 +15,36 @@ import FreeCADGui as Gui
 import Part
 from FreeCAD import Vector
 from PySide import QtGui, QtCore
-import math
+
+def get_adjacent_faces(edge, shape):
+    """获取包含此边的所有面（不依赖顶点，圆形边也适用）."""
+    mid_p = (edge.FirstParameter + edge.LastParameter) / 2.0
+    mid_pt = edge.valueAt(mid_p)
+    faces = []
+    for f in shape.Faces:
+        try:
+            d, _, _ = f.distToShape(Part.Vertex(mid_pt))
+            if d < 1e-5:
+                faces.append(f)
+        except Exception:
+            pass
+    return faces
 
 
-def vertices_equal(v1, v2, tol=1e-7):
-    return v1.Point.distanceToPoint(v2.Point) < tol
+def edges_same(e1, e2, tol=1e-5):
+    """判断两条边是否是同一条."""
+    mid1 = (e1.FirstParameter + e1.LastParameter) / 2.0
+    mid2 = (e2.FirstParameter + e2.LastParameter) / 2.0
+    if e1.valueAt(mid1).distanceToPoint(e2.valueAt(mid2)) > tol:
+        return False
+    return abs(e1.Length - e2.Length) < tol
 
 
 def get_min_adjacent_edge_length(selected_edge, shape):
     min_len = float('inf')
-    v0 = selected_edge.Vertexes[0].Point
-    v1 = selected_edge.Vertexes[1].Point
-    for face in shape.Faces:
-        f_verts = [vp.Point for vp in face.Vertexes]
-        hits = 0
-        for sv in [v0, v1]:
-            for fv in f_verts:
-                if sv.distanceToPoint(fv) < 1e-6:
-                    hits += 1
-                    break
-        if hits < 2:
-            continue
+    for face in get_adjacent_faces(selected_edge, shape):
         for other_edge in face.Edges:
-            ov0 = other_edge.Vertexes[0].Point
-            ov1 = other_edge.Vertexes[1].Point
-            if ((ov0.distanceToPoint(v0) < 1e-6 and ov1.distanceToPoint(v1) < 1e-6)
-                    or (ov0.distanceToPoint(v1) < 1e-6 and ov1.distanceToPoint(v0) < 1e-6)):
+            if edges_same(other_edge, selected_edge):
                 continue
             L = other_edge.Length
             if L > 1e-7 and L < min_len:
@@ -73,34 +77,36 @@ def get_tip(body):
 
 
 def create_chamfer_cutter(shape, edge_idx, chamfer_dist):
-    """构造倒角切割楔体（三角形截面沿边拉伸）."""
+    """构造倒角切割楔体（直线边可用，圆形边会报错）."""
     edge = shape.Edges[edge_idx]
-    v0 = edge.Vertexes[0].Point
-    v1 = edge.Vertexes[1].Point
-    ev = (v1 - v0).normalize()
     d = chamfer_dist
 
-    # 法向量
-    faces = []
+    # 获取边的起终点（参数方式，兼容圆形边）
+    fp = edge.FirstParameter
+    lp = edge.LastParameter
+    v0 = edge.valueAt(fp)
+    v1 = edge.valueAt(lp)
+    # 圆形边起终点相同，取半圈位置
+    if v0.distanceToPoint(v1) < 1e-5:
+        v1 = edge.valueAt(fp + (lp - fp) / 2.0)
+
+    # 边方向取中点切线
+    mid_p = (fp + lp) / 2.0
+    ev = edge.tangentAt(mid_p)
+    ev.normalize()
+
+    # 相邻面
+    adj_faces = get_adjacent_faces(edge, shape)
     normals = []
-    for f in shape.Faces:
-        f_verts = [vp.Point for vp in f.Vertexes]
-        hits = 0
-        for sv in [v0, v1]:
-            for fv in f_verts:
-                if sv.distanceToPoint(fv) < 1e-6:
-                    hits += 1
-                    break
-        if hits >= 2:
-            faces.append(f)
-            n = f.normalAt(0.5, 0.5)
-            normals.append(n)
+    for f in adj_faces:
+        n = f.normalAt(0.5, 0.5)
+        normals.append(n)
 
     if len(normals) < 2:
         raise RuntimeError("边至少需要两个相邻面")
 
     n0, n1 = normals[0], normals[1]
-    for i, (n, f) in enumerate([(n0, faces[0]), (n1, faces[1])]):
+    for i, (n, f) in enumerate([(n0, adj_faces[0]), (n1, adj_faces[1])]):
         center = f.CenterOfMass
         if n.dot(center - v0) < 0:
             normals[i] = -n
